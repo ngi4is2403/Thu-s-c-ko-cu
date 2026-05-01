@@ -51,7 +51,7 @@
           </div>
           <div style="font-size:13px;color:var(--text-muted);line-height:1.6;">
             Vị trí bạn chọn có trụ sạc gần đó.<br>
-            Giá sạc: <strong style="color:var(--electric);">{{ '{:,.0f}'.format(charging_rate) }}đ/giờ</strong><br>
+            Giá sạc: <strong style="color:var(--electric);">{{ '{:,.0f}'.format(charging_rate | default(0)) }}đ/giờ</strong><br>
             <span style="font-size:12px;">Phí sạc sẽ được tính tự động theo thời gian và trừ từ ví khi lấy xe.</span>
           </div>
         </div>
@@ -167,16 +167,20 @@ function updateChargingOption() {
 }
 
 // Override slot click handler to also update charging option
-const origSlotInput = document.getElementById('slot_id');
-document.addEventListener('click', (e) => {
-  const card = e.target.closest('.slot-card[data-slot-id]');
-  if (!card) return;
-  const container = card.closest('#slots-container');
-  if (!container) return;
-  container.querySelectorAll('.slot-card').forEach(c => c.classList.remove('selected'));
-  card.classList.add('selected');
   if (origSlotInput) origSlotInput.value = card.dataset.slotId;
   updateChargingOption();
 });
+
+// Auto-select slot if passed from URL/Server
+window.onload = function() {
+  const selSid = "{{ selected_sid or '' }}";
+  if (selSid) {
+    const card = document.querySelector(`.slot-card[data-slot-id="${selSid}"]`);
+    if (card) {
+      card.click();
+      card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }
+};
 </script>
 {% endblock %}

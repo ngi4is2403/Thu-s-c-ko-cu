@@ -279,6 +279,32 @@ TABLES = [
         FOREIGN KEY (confirmed_by) REFERENCES users(id) ON DELETE SET NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
+
+    # ── Bảng đặt lịch trước ─────────────────────────────────────────
+    # User đặt chỗ trước, trả tiền ngay, đến check-in trong 10 phút
+    # Nếu no-show → phạt 30%, hoàn 70%
+    """
+    CREATE TABLE IF NOT EXISTS bookings (
+        id              INT AUTO_INCREMENT PRIMARY KEY,
+        user_id         INT NOT NULL,
+        vehicle_id      INT NOT NULL,
+        slot_id         INT NOT NULL,
+        scheduled_time  DATETIME NOT NULL,
+        duration_hours  FLOAT NOT NULL DEFAULT 1,
+        total_fee       INT NOT NULL DEFAULT 0,
+        penalty_fee     INT NOT NULL DEFAULT 0,
+        refund_fee      INT NOT NULL DEFAULT 0,
+        status          ENUM('pending','active','completed','no_show','cancelled')
+                        NOT NULL DEFAULT 'pending',
+        notes           TEXT,
+        created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        checkin_at      DATETIME,
+        checkout_at     DATETIME,
+        FOREIGN KEY (user_id)    REFERENCES users(id),
+        FOREIGN KEY (vehicle_id) REFERENCES vehicles(id),
+        FOREIGN KEY (slot_id)    REFERENCES parking_slots(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -548,6 +574,50 @@ def init_db():
             cur.execute(f"UPDATE users SET balance={DEFAULT_WALLET_BALANCE} WHERE balance=0")
             conn.commit()
             print("[DB] Migration complete.")
+
+        # Bước 2.6: Migration — tạo bảng bookings nếu chưa có
+        try:
+            cur.execute("SELECT id FROM bookings LIMIT 1")
+        except Exception:
+            print("[DB] Migration: Creating 'bookings' table...")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bookings (
+                    id              INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id         INT NOT NULL,
+                    vehicle_id      INT NOT NULL,
+                    slot_id         INT NOT NULL,
+                    scheduled_time  DATETIME NOT NULL,
+                    duration_hours  FLOAT NOT NULL DEFAULT 1,
+                    total_fee       INT NOT NULL DEFAULT 0,
+                    penalty_fee     INT NOT NULL DEFAULT 0,
+                    refund_fee      INT NOT NULL DEFAULT 0,
+                    status          ENUM('pending','active','completed','no_show','cancelled')
+                                    NOT NULL DEFAULT 'pending',
+                    notes           TEXT,
+                    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    checkin_at      DATETIME,
+                    checkout_at     DATETIME,
+                    FOREIGN KEY (user_id)    REFERENCES users(id),
+                    FOREIGN KEY (vehicle_id) REFERENCES vehicles(id),
+                    FOREIGN KEY (slot_id)    REFERENCES parking_slots(id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            conn.commit()
+            print("[DB] Migration: bookings table created.")
+
+        # Bước 2.7: Migration — thêm cột booking_id vào parking_orders
+        try:
+            cur.execute("SELECT booking_id FROM parking_orders LIMIT 1")
+        except Exception:
+            print("[DB] Migration: Adding 'booking_id' to parking_orders...")
+            cur.execute(
+                "ALTER TABLE parking_orders "
+                "ADD COLUMN booking_id INT DEFAULT NULL, "
+                "ADD COLUMN early_fee INT NOT NULL DEFAULT 0, "
+                "ADD COLUMN booking_credit INT NOT NULL DEFAULT 0"
+            )
+            conn.commit()
+            print("[DB] Migration: parking_orders updated.")
 
         # Bước 3: Kiểm tra và seed nếu DB mới trống
         cur.execute("SELECT COUNT(*) as cnt FROM users")

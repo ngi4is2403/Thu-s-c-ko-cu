@@ -18,8 +18,10 @@ from flask import (Flask, render_template, request, redirect,
 from functools import wraps
 
 from database import init_db         # Hàm khởi tạo MySQL schema + seed data
+import json
 from config import VEHICLE_TYPES, SECRET_KEY, CHARGING_RATE_PER_HOUR, \
-                   VIETQR_BANK_ID, VIETQR_ACCOUNT_NO, VIETQR_ACCOUNT_NAME, VIETQR_TEMPLATE
+                   VIETQR_BANK_ID, VIETQR_ACCOUNT_NO, VIETQR_ACCOUNT_NAME, VIETQR_TEMPLATE, \
+                   PARKING_RATES, SMALL_VEHICLES
 
 # ── Import các hàm nghiệp vụ từ 3 module service ──────────────────────────────
 from modules.user_service    import (register_user, login, get_user_by_id,
@@ -39,6 +41,11 @@ from modules.parking_service import (get_available_slots, create_parking_order,
                                      get_all_stations, add_station, update_station_status,
                                      get_all_parking_orders, get_all_charging_orders)
 from modules.report_service  import get_full_monthly_report
+from modules.booking_service import (create_booking, get_user_bookings, get_booking_by_id,
+                                      cancel_booking, checkin_booking,
+                                      auto_mark_no_show, auto_activate_pending_bookings,
+                                      fix_booking_integrity,
+                                      admin_get_all_bookings, admin_checkin_booking, admin_cancel_booking)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KHỞI TẠO ỨNG DỤNG FLASK
@@ -253,27 +260,34 @@ def user_park():
     uid  = session["user_id"]
     vehs = get_vehicles(uid)["data"]
 
+    # Lấy pre-selected từ URL (nếu có từ trang Đặt lịch nhảy sang)
+    sel_slot = request.args.get("slot_id")
+    sel_veh  = request.args.get("vehicle_id")
+
     if request.method == "POST":
-        vid     = int(request.form.get("vehicle_id",0))
-        slot_id = int(request.form.get("slot_id",0))
+        vid     = int(request.form.get("vehicle_id") or 0)
+        slot_id = int(request.form.get("slot_id") or 0)
         notes   = request.form.get("notes","")
         want_charging = request.form.get("want_charging") == "1"
         result  = create_parking_order(uid, vid, slot_id, notes, want_charging)
         flash(result["message"], "success" if result["success"] else "danger")
         if result["success"]:
             return redirect(url_for("user_dashboard"))
-        # Nếu lỗi → render lại form với danh sách slot
+        # Nếu lỗi → render lại form
         vtype = ""
         for v in vehs:
-            if v["id"] == vid:
-                vtype = v["vehicle_type"]
-        slots = get_available_slots(vtype)["data"]
+            if v["id"] == vid: vtype = v["vehicle_type"]
+        slots = get_available_slots(vtype, user_id=uid)["data"]
         return render_template("user/park.html", vehicles=vehs, slots=slots,
-                               selected_vid=vid, vehicle_types=VEHICLE_TYPES)
+                               selected_vid=vid, selected_sid=slot_id,
+                               vehicle_types=VEHICLE_TYPES,
+                               charging_rate=CHARGING_RATE_PER_HOUR)
 
-    # GET: Lấy tất cả slot trống (chưa lọc theo loại xe)
-    slots = get_available_slots()["data"]
+    # GET: Hiển thị form
+    slots = get_available_slots(user_id=uid)["data"]
     return render_template("user/park.html", vehicles=vehs, slots=slots,
+                           selected_vid=int(sel_veh) if sel_veh else None,
+                           selected_sid=int(sel_slot) if sel_slot else None,
                            vehicle_types=VEHICLE_TYPES,
                            charging_rate=CHARGING_RATE_PER_HOUR)
 
@@ -478,6 +492,87 @@ def user_history():
     return render_template("user/history.html", history=history,
                            filters={"month": month, "year": year,
                                     "type": tx_type, "status": status})
+
+
+# ── Đặt lịch trước ───────────────────────────────────────────────────────────
+
+@app.route("/user/bookings", methods=["GET", "POST"])
+@role_required("user")
+def user_bookings():
+    """
+    GET  → Hiển thị form đặt lịch + danh sách đặt lịch của user
+    POST → Tạo đặt lịch mới
+    """
+    # Tự động xử lý bookings: mark no-show và activate pending đã đến giờ
+    auto_mark_no_show()
+    auto_activate_pending_bookings()
+    uid  = session["user_id"]
+    vehs = get_vehicles(uid)["data"]
+    slots = get_available_slots()["data"]
+
+    if request.method == "POST":
+        vid            = int(request.form.get("vehicle_id", 0))
+        slot_id        = int(request.form.get("slot_id", 0))
+        scheduled_time = request.form.get("scheduled_time", "")
+        duration_hours = float(request.form.get("duration_hours", 1) or 1)
+        notes          = request.form.get("notes", "")
+
+        result = create_booking(uid, vid, slot_id, scheduled_time, duration_hours, notes)
+        if result["success"]:
+            # Redirect sang trang xác nhận đặt lịch
+            return redirect(url_for("user_booking_confirm", bid=result["data"]["booking_id"]))
+        flash(result["message"], "danger")
+
+    bookings = get_user_bookings(uid)["data"]
+    return render_template("user/bookings.html",
+                           vehicles=vehs, slots=slots,
+                           bookings=bookings,
+                           vehicle_types=VEHICLE_TYPES,
+                           rates_json=PARKING_RATES,
+                           small_types_json=list(SMALL_VEHICLES))
+
+
+@app.route("/user/bookings/confirm/<int:bid>")
+@role_required("user")
+def user_booking_confirm(bid):
+    """Trang xác nhận sau khi đặt lịch thành công."""
+    uid     = session["user_id"]
+    auto_mark_no_show()
+    booking = get_booking_by_id(bid, uid)["data"]
+    if not booking:
+        flash("Đặt lịch không tồn tại.", "danger")
+        return redirect(url_for("user_bookings"))
+    return render_template("user/booking_confirm.html", booking=booking)
+
+
+@app.route("/user/bookings/cancel/<int:bid>", methods=["POST"])
+@role_required("user")
+def user_cancel_booking(bid):
+    """Huỷ đặt lịch — hoàn tiền 100%."""
+    uid    = session["user_id"]
+    result = cancel_booking(bid, uid)
+    flash(result["message"], "success" if result["success"] else "danger")
+    return redirect(url_for("user_bookings"))
+
+
+@app.route("/user/bookings/checkin/<int:bid>", methods=["POST"])
+@role_required("user")
+def user_checkin_booking(bid):
+    """Check-in cho đặt lịch."""
+    uid    = session["user_id"]
+    result = checkin_booking(bid, uid)
+    flash(result["message"], "success" if result["success"] else "danger")
+    if result["success"]:
+        return redirect(url_for("user_dashboard"))
+    return redirect(url_for("user_bookings"))
+
+
+@app.route("/api/slots-available")
+@role_required("user")
+def api_slots_available():
+    """API lấy slot đồng thời cho đặt lịch (lọc theo loại xe)."""
+    vtype = request.args.get("vehicle_type", "")
+    return jsonify(get_available_slots(vtype))
 
 # =============================================================================
 # NHÓM ROUTES: ADMIN — Vận hành bãi đỗ hàng ngày
@@ -889,6 +984,49 @@ def admin_report():
                            report=report, year=year, month=month)
 
 # =============================================================================
+# NHÓM ROUTES: ADMIN — Quản lý đặt lịch
+# =============================================================================
+
+@app.route("/admin/bookings")
+@role_required("admin")
+def admin_bookings():
+    """
+    Danh sách tất cả đặt lịch.
+    Lọc: ?status=pending|active|completed|no_show|cancelled
+    Tìm kiếm: ?search=51A
+    Admin có thể check-in hoặc huỷ booking.
+    """
+    auto_mark_no_show()
+    status_f     = request.args.get("status", "")
+    search_plate = request.args.get("search", "")
+    bookings = admin_get_all_bookings(
+        status_filter=status_f if status_f else None,
+        search_plate=search_plate if search_plate else None
+    )["data"]
+    return render_template("admin/bookings.html",
+                           bookings=bookings, status_f=status_f, search=search_plate,
+                           vehicle_types=VEHICLE_TYPES)
+
+
+@app.route("/admin/bookings/checkin/<int:bid>", methods=["POST"])
+@role_required("admin")
+def admin_do_checkin_booking(bid):
+    """Admin check-in thay user — không bị giới hạn 10 phút."""
+    result = admin_checkin_booking(bid)
+    flash(result["message"], "success" if result["success"] else "danger")
+    return redirect(url_for("admin_bookings"))
+
+
+@app.route("/admin/bookings/cancel/<int:bid>", methods=["POST"])
+@role_required("admin")
+def admin_do_cancel_booking(bid):
+    """Admin huỷ booking — chọn % hoàn tiền."""
+    refund_pct = int(request.form.get("refund_percent", 100))
+    result = admin_cancel_booking(bid, refund_percent=refund_pct)
+    flash(result["message"], "success" if result["success"] else "danger")
+    return redirect(url_for("admin_bookings"))
+
+# =============================================================================
 # KHỞI ĐỘNG SERVER
 # =============================================================================
 
@@ -901,6 +1039,9 @@ if __name__ == "__main__":
 
     # Khởi tạo MySQL database (tạo bảng + seed data nếu chưa có)
     init_db()
+
+    # Sửa dữ liệu booking bị lỗi trạng thái (chạy 1 lần khi khởi động)
+    fix_booking_integrity()
 
     print("\n" + "="*60)
     print("  [SERVER] He thong Bai Do Xe & Sac Dien")
